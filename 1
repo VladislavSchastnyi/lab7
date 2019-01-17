@@ -1,0 +1,196 @@
+
+#include "stdafx.h"
+
+#include <iostream>
+#include <thread>
+#include <boost/thread/thread.hpp>
+#include <boost/asio/ip/tcp.hpp>
+#include <boost/asio.hpp>
+#include <boost/thread/recursive_mutex.hpp>
+
+using namespace std;
+using namespace boost::asio;
+
+/*Команда login*/
+constexpr auto cmd_login = "login ";
+/*Команда clients*/
+constexpr auto cmd_clients = "clients";
+/*Команда ping*/
+char cmd_ping[] = "ping";
+
+/*Экземпляр io_service для общения с сервисом ввода/вывода операционной системы*/
+boost::asio::io_service service;
+
+/*Порт для ожидания подключения*/
+#define server_connect_port 8001
+/*Размер буфера для получения данных от клиента*/
+#define client_data_size 512
+
+/*Класс для работы с клиентом*/
+struct talk_to_client {
+	talk_to_client()
+		: socket(service) {
+		for (int i = 0; i < client_data_size; i++) data[i] = 0;
+	}
+	
+	//Получение сокета
+	ip::tcp::socket & sock() { return socket; }
+
+	//Буфер для данных от клиента
+	char data[client_data_size];
+	
+	//Текущая позиция считанных от клиента данных в буфере данных
+	unsigned int curr_data_pos = 0;
+
+	//Имя пользователя
+	string username;
+
+	//Время последней команды ping
+	time_t ping_time=0;
+private:
+	//Сокет для работы
+	ip::tcp::socket socket;
+};
+
+/*Массив клиентов*/
+std::vector<std::shared_ptr<talk_to_client>> clients;
+
+/*Мютекс для защиты доступа к массиву клиентов*/
+boost::recursive_mutex client_array_mutex;
+
+/*Поток, для прослушивания*/
+void accept_thread() {
+	//Код ошибки выполнения синхронных операций
+	boost::system::error_code ec;
+
+	//Создание адреса и порта
+	ip::tcp::endpoint ep(ip::tcp::v4(), server_connect_port); 
+	ip::tcp::acceptor acceptor(service, ep);
+
+	while (true) {
+		//Структура для клиента с инициализацией сокета
+		auto client = std::make_shared<talk_to_client>();
+		//Получение запроса от клиента на установление соединения
+		acceptor.accept(client->sock(), ec);
+		if (!ec) {
+			//Защита передачи структуры в поток для обработки
+			boost::recursive_mutex::scoped_lock lock(client_array_mutex);
+			//Передача структуры в поток для обработки
+			clients.push_back(client);
+		}
+		else {
+			//Завершение цикла в случае ошибки установления соединения
+			cout << "Error " << ec << " connect from client." << endl;
+			break;
+		}
+	}
+}
+
+/*Обработка команд от клиента*/
+int answer_to_client(std::shared_ptr<talk_to_client> client) {
+	//Код ошибки выполнения синхронных операций
+	boost::system::error_code ec;
+	//Буфер для чтения данных
+	char client_data[512];
+	//Возвращаемый код ошибки
+	int error = 1;
+
+	size_t read_server_data_len = client->sock().read_some(buffer(client_data), ec);
+	//cout << "Data len from client " << read_server_data_len << endl;
+	if (!ec) {
+		//Копирование принятых данных в буфер с контролем завершающего '/n'
+		for (size_t i = 0; i < read_server_data_len; i++) {
+			if ((client->curr_data_pos + i) < client_data_size) {
+				if (client_data[i] != '\n') {
+					client->data[client->curr_data_pos + i] = client_data[i];
+					cout << client->data[client->curr_data_pos + i];
+				}
+				else {
+					error = 0;
+					client->curr_data_pos = client->curr_data_pos + i;
+					cout << endl;
+					break;
+				}
+			}
+			else {
+				error = 2;
+				break;
+			}
+		}
+		if (error == 0) {
+			//Обработка команды от клиента
+			string cmd_str(client->data, client->curr_data_pos);
+
+			if (cmd_str.find(cmd_ping) == 0) {
+				cout << "Cmd ping" << endl;
+				//Строка для посыла ответа клиенту на команду ping 
+				string ping_str(cmd_ping);
+				client->ping_time = std::time(nullptr);
+				cout << "Ping time " << client->ping_time << endl;
+				client->sock().write_some(buffer(ping_str + " Ok" + '\n'), ec);
+			}
+			else {
+				if (cmd_str.find(cmd_clients) == 0) {
+					cout << "Cmd clients" << endl;
+				}
+				else {
+					if (cmd_str.find(cmd_login) == 0) {
+						cout << "Cmd login" << endl;
+						client->username.append(&(client->data[6]), client->curr_data_pos - 6);
+						//Строка для посыла ответа клиенту на команду login 
+						string login_str(cmd_login);
+
+						client->sock().write_some(buffer(login_str + "Ok" + '\n'), ec);
+					}
+					else {
+						cout << "Invalid " << endl;
+					}
+				}
+			}
+			for (int i = 0; i < client_data_size; i++) client->data[i] = 0;
+			client->curr_data_pos = 0;
+		}
+		else {
+			//Данные от клиента приняты, сохранены в буфер, но '/n' не получен
+			if (error == 2) {
+				client->curr_data_pos = client->curr_data_pos + read_server_data_len;
+				error = 0;
+			}
+		}
+	}
+	
+	return error;
+}
+
+/*Поток для обработки*/
+void handle_clients_thread() {
+	while (true) {
+		std::this_thread::sleep_for(std::chrono::milliseconds { 1 });
+		boost::recursive_mutex::scoped_lock lock(client_array_mutex);
+		for (auto& client : clients) {
+			// for each client calling answer_to_client();
+			answer_to_client(client);
+		}
+		// and then erase clients that timed out
+		int i=0;
+		for (auto& client : clients) {
+			time_t k= ((std::time(nullptr) - client->ping_time));
+			cout <<   k << endl;
+			if ((client->ping_time != 0) && ((std::time(nullptr) - client->ping_time) > 1)) {
+				//Уничтожение экземпляра стуктуры
+				clients.erase(clients.begin()+i);
+				cout << "erase" << endl;
+			}
+			i++;
+		}
+	}
+}
+
+int main(int /*argc*/, char* /*argv*/[]) {
+
+	boost::thread_group threads;
+	threads.create_thread(accept_thread);
+	threads.create_thread(handle_clients_thread);
+	threads.join_all();
+}
+
